@@ -1,5 +1,5 @@
 <#
-    WhatChanged - System History Correlator (v0.6)
+    WhatChanged - System History Correlator (v1.1)
     Windows 10 / 11
 #>
 
@@ -10,7 +10,6 @@ if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
 }
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml
-Add-Type -AssemblyName System.Windows.Forms
 
 # ---------------------------
 # Data functions
@@ -18,25 +17,55 @@ Add-Type -AssemblyName System.Windows.Forms
 
 function Get-SysDeltaRestorePoints {
     try {
-        Get-ComputerRestorePoint | ForEach-Object {
-            [pscustomobject]@{
-                Created          = [System.Management.ManagementDateTimeConverter]::ToDateTime($_.CreationTime)
-                SequenceNumber   = $_.SequenceNumber
-                Description      = $_.Description
-                EventType        = $_.EventType
-                RestorePointType = $_.RestorePointType
+        $points = Get-ComputerRestorePoint -ErrorAction Stop
+    } catch {
+        return @()
+    }
+
+    $points | ForEach-Object {
+        $created = $_.CreationTime
+        try {
+            if ($created -isnot [datetime]) {
+                $created = [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$_.CreationTime)
             }
+        } catch {
+            # leave $created as raw value if conversion fails
         }
-    } catch { @() }
+
+        # decode type a bit for readability
+        $rpType = switch ($_.RestorePointType) {
+            0  { 'Application Install' }
+            1  { 'Application Uninstall' }
+            10 { 'Driver Install' }
+            12 { 'Modify Settings' }
+            13 { 'Cancelled Operation' }
+            default { "Type $($_.RestorePointType)" }
+        }
+
+        [pscustomobject]@{
+            Created          = $created
+            SequenceNumber   = $_.SequenceNumber
+            Description      = $_.Description
+            EventType        = $_.EventType          # BEGIN/END, etc.
+            RestorePointType = $rpType
+        }
+    }
 }
 
 function Get-SysDeltaShadowCopies {
     try {
         Get-CimInstance Win32_ShadowCopy | ForEach-Object {
+            $created = $_.InstallDate
+            try {
+                if ($created -isnot [datetime]) {
+                    $created = [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$_.InstallDate)
+                }
+            } catch { }
+
             [pscustomobject]@{
-                Created            = [System.Management.ManagementDateTimeConverter]::ToDateTime($_.InstallDate)
-                ID                 = $_.ID
+                Created            = $created
                 VolumeName         = $_.VolumeName
+                ID                 = $_.ID
                 ClientAccessible   = $_.ClientAccessible
                 OriginatingMachine = $_.OriginatingMachine
                 ServiceMachine     = $_.ServiceMachine
@@ -371,17 +400,27 @@ $script:DataFwEvents    = @()
 # ---------------------------
 # Helpers
 # ---------------------------
+
+function New-Observable {
+    param([object[]]$Items)
+
+    $oc = New-Object 'System.Collections.ObjectModel.ObservableCollection[psobject]'
+    foreach ($item in @($Items)) {
+        if ($null -ne $item) {
+            [void]$oc.Add([pscustomobject]$item)
+        }
+    }
+    return $oc
+}
+
 function Show-BusyOverlay {
     param(
         [string]$Message = "Loading..."
     )
 
-    if ($lblBusyText) { $lblBusyText.Text = $Message }
-    if ($busyOverlay) { $busyOverlay.Visibility = 'Visible' }
+    if ($lblBusyText)  { $lblBusyText.Text = $Message }
+    if ($busyOverlay)  { $busyOverlay.Visibility = 'Visible' }
     $window.Cursor = 'Wait'
-
-    # Let WPF process the layout change before we block with heavy work
-    [System.Windows.Forms.Application]::DoEvents() | Out-Null
 }
 
 function Hide-BusyOverlay {
@@ -395,31 +434,39 @@ function Apply-SearchFilter {
         [string]$Search
     )
 
-    if (-not $Data) { return @() }
-    if ([string]::IsNullOrWhiteSpace($Search)) { return $Data }
+    $array = @($Data)
 
-    $pattern = "*$Search*"
-
-    $Data | Where-Object {
-        $values = $_.PSObject.Properties.Value | ForEach-Object { [string]$_ }
-        ($values -join ' ') -like $pattern
+    if (-not $array -or $array.Count -eq 0) {
+        return (New-Observable @())
     }
+
+    if (-not [string]::IsNullOrWhiteSpace($Search)) {
+        $pattern = "*$Search*"
+        $array = $array | Where-Object {
+            $values = $_.PSObject.Properties.Value | ForEach-Object { [string]$_ }
+            ($values -join ' ') -like $pattern
+        }
+        $array = @($array)
+    }
+
+    return (New-Observable $array)
 }
 
 function Apply-ReliabilitySeverityFilter {
-    param([object[]]$Data)
+    param($Data)
 
-    if (-not $Data) { return @() }
+    $dataArray = @($Data)
+    if (-not $dataArray -or $dataArray.Count -eq 0) { return @() }
 
     $item = [System.Windows.Controls.ComboBoxItem]$cmbRelSeverity.SelectedItem
     $tag  = if ($item -and $item.Tag) { [string]$item.Tag } else { 'All' }
 
     switch ($tag) {
-        'Critical'    { $Data | Where-Object { $_.Level -eq 1 } }
-        'ErrorPlus'   { $Data | Where-Object { $_.Level -le 2 } }
-        'WarningPlus' { $Data | Where-Object { $_.Level -le 3 } }
-        'InfoPlus'    { $Data | Where-Object { $_.Level -le 4 } }
-        default       { $Data }
+        'Critical'    { $dataArray | Where-Object { $_.Level -eq 1 } }
+        'ErrorPlus'   { $dataArray | Where-Object { $_.Level -le 2 } }
+        'WarningPlus' { $dataArray | Where-Object { $_.Level -le 3 } }
+        'InfoPlus'    { $dataArray | Where-Object { $_.Level -le 4 } }
+        default       { $dataArray }
     }
 }
 
@@ -439,9 +486,16 @@ function Update-CurrentTabView {
 
     switch ($header) {
         'Restore & Shadow' {
-            $dgRestore.ItemsSource = Apply-SearchFilter -Data $script:DataRestore -Search $search
-            $dgShadows.ItemsSource = Apply-SearchFilter -Data $script:DataShadows -Search $search
+            $filteredRestore = Apply-SearchFilter -Data $script:DataRestore  -Search $search
+            $filteredShadows = Apply-SearchFilter -Data $script:DataShadows -Search $search
+
+            # ALWAYS give WPF an array, even if there is just a single object
+            $dgRestore.ItemsSource  = @($filteredRestore)
+            $dgShadows.ItemsSource  = @($filteredShadows)
+
+            $lblStatus.Text = "Restore points: $(@($script:DataRestore).Count); Shadow copies: $(@($script:DataShadows).Count)"
         }
+
         'System Info' {
             $dgSysInfo.ItemsSource = Apply-SearchFilter -Data $script:DataSysInfo -Search $search
         }
@@ -461,6 +515,7 @@ function Update-CurrentTabView {
     }
 }
 
+
 function Load-SysHistoryData {
     param([datetime]$Since)
 
@@ -470,23 +525,23 @@ function Load-SysHistoryData {
 
     try {
         # System info
-        $script:DataSysInfo = Get-SystemSummary
+        $script:DataSysInfo = @(Get-SystemSummary)
 
         # Restore & Shadow
-        $script:DataRestore = Get-SysDeltaRestorePoints | Sort-Object Created -Descending
-        $script:DataShadows = Get-SysDeltaShadowCopies | Sort-Object Created -Descending
+        $script:DataRestore = @(Get-SysDeltaRestorePoints | Sort-Object Created -Descending)
+        $script:DataShadows = @(Get-SysDeltaShadowCopies | Sort-Object Created -Descending)
 
         # Reliability
-        $script:DataReliability = Get-SysDeltaReliability -Since $Since | Sort-Object TimeGenerated -Descending
+        $script:DataReliability = @(Get-SysDeltaReliability -Since $Since | Sort-Object TimeGenerated -Descending)
 
         # Updates / Installs
-        $script:DataUpdates = Get-SysDeltaUpdateEvents -Since $Since | Sort-Object TimeCreated -Descending
+        $script:DataUpdates = @(Get-SysDeltaUpdateEvents -Since $Since | Sort-Object TimeCreated -Descending)
 
         # Firewall current rules (not time-filtered, state at present)
-        $script:DataFwRules = Get-SysDeltaFirewallRules
+        $script:DataFwRules = @(Get-SysDeltaFirewallRules)
 
         # Firewall events
-        $script:DataFwEvents = Get-SysDeltaFirewallEvents -Since $Since | Sort-Object TimeCreated -Descending
+        $script:DataFwEvents = @(Get-SysDeltaFirewallEvents -Since $Since | Sort-Object TimeCreated -Descending)
 
         Update-CurrentTabView
 
@@ -573,13 +628,17 @@ function Focus-UpdatesAndFirewall-AroundSelectedReliability {
     $from = $center.AddHours(-2)
     $to   = $center.AddHours(2)
 
-    $dgUpdates.ItemsSource = $script:DataUpdates | Where-Object {
-        $_.TimeCreated -ge $from -and $_.TimeCreated -le $to
-    }
+    $dgUpdates.ItemsSource = New-Observable (
+        $script:DataUpdates | Where-Object {
+            $_.TimeCreated -ge $from -and $_.TimeCreated -le $to
+        }
+    )
 
-    $dgFwEvents.ItemsSource = $script:DataFwEvents | Where-Object {
-        $_.TimeCreated -ge $from -and $_.TimeCreated -le $to
-    }
+    $dgFwEvents.ItemsSource = New-Observable (
+        $script:DataFwEvents | Where-Object {
+            $_.TimeCreated -ge $from -and $_.TimeCreated -le $to
+        }
+    )
 
     $lblStatus.Text = "Focused Updates & Firewall to events between $from and $to. Refresh to reset."
 }
